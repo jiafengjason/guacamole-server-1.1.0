@@ -53,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <regex.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
@@ -170,14 +171,58 @@ void* ssh_input_thread(void* data) {
 
     guac_client* client = (guac_client*) data;
     guac_ssh_client* ssh_client = (guac_ssh_client*) client->data;
-
-    char buffer[8192];
+    guac_terminal* term = ssh_client->term;
+        
+    char buffer[8192] = {0};
     int bytes_read;
 
     /* Write all data read */
     while ((bytes_read = guac_terminal_read_stdin(ssh_client->term, buffer, sizeof(buffer))) > 0) {
         pthread_mutex_lock(&(ssh_client->term_channel_lock));
-        libssh2_channel_write(ssh_client->term_channel, buffer, bytes_read);
+
+        guac_client_log(client, GUAC_LOG_INFO, "Input before parse(%d): %hhx%hhx%hhx%hhx%hhx", bytes_read, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]);
+        guac_client_log(client, GUAC_LOG_INFO, "Input before parse: %d-%d-%d-%d-%d-%d-%d-%d-%d-%d", term->charLength[0], term->charLength[1], term->charLength[2], term->charLength[3], term->charLength[4], term->charLength[5], term->charLength[6], term->charLength[7], term->charLength[8], term->charLength[9]);
+
+        if(term->inVimState)
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Input in vim state");
+            memset(term->line,0,sizeof(term->line));
+            term->pos = 0;
+            libssh2_channel_write(ssh_client->term_channel, buffer, bytes_read);
+        }
+        else
+        {
+            parseLines(client, term, buffer, bytes_read);
+            guac_client_log(client, GUAC_LOG_INFO, "Input after parse(%d): %s", term->pos, term->line);
+            guac_client_log(client, GUAC_LOG_INFO, "Input after parse: %d-%d-%d-%d-%d-%d-%d-%d-%d-%d", term->charLength[0], term->charLength[1], term->charLength[2], term->charLength[3], term->charLength[4], term->charLength[5], term->charLength[6], term->charLength[7], term->charLength[8], term->charLength[9]);
+
+            if(term->isEnter)
+            {
+                term->inputState = false;
+                if(term->isForbidden)
+                {
+                    //回显
+                    guac_terminal_write(term, term->fbdMsg, strlen(term->fbdMsg));
+                    //\x15清除整行
+                    libssh2_channel_write(ssh_client->term_channel, "\x15\r", 2);
+                }
+                else
+                {
+                    libssh2_channel_write(ssh_client->term_channel, buffer, bytes_read);
+                }
+                memset(term->line,0,sizeof(term->line));
+                memset(term->charLength,0,sizeof(term->charLength));
+                term->pos = 0;
+            }
+            else
+            {
+                term->inputState = true;
+                libssh2_channel_write(ssh_client->term_channel, buffer, bytes_read);
+            }
+            term->isForbidden = false;
+            term->isEnter = false;
+            memset(buffer, 0 , sizeof(buffer));
+        }
         pthread_mutex_unlock(&(ssh_client->term_channel_lock));
 
         /* Make sure ssh_input_thread can be terminated anyway */
@@ -197,7 +242,7 @@ void* ssh_client_thread(void* data) {
     guac_ssh_client* ssh_client = (guac_ssh_client*) client->data;
     guac_ssh_settings* settings = ssh_client->settings;
 
-    char buffer[8192];
+    char buffer[8192] = {0};
 
     pthread_t input_thread;
 
@@ -427,7 +472,9 @@ void* ssh_client_thread(void* data) {
         /* Read terminal data */
         bytes_read = libssh2_channel_read(ssh_client->term_channel,
                 buffer, sizeof(buffer));
-
+        buffer[bytes_read] = '\0';
+        //guac_client_log(client, GUAC_LOG_INFO, "SSH client read: %d", bytes_read);
+        
         pthread_mutex_unlock(&(ssh_client->term_channel_lock));
 
         /* Attempt to write data received. Exit on failure. */

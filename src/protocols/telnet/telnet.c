@@ -354,12 +354,67 @@ static void* __guac_telnet_input_thread(void* data) {
 
     char buffer[8192];
     int bytes_read;
+    guac_terminal* term = telnet_client->term;
 
     /* Write all data read */
-    while ((bytes_read = guac_terminal_read_stdin(telnet_client->term, buffer, sizeof(buffer))) > 0) {
-        telnet_send(telnet_client->telnet, buffer, bytes_read);
-        if (telnet_client->echo_enabled)
-            guac_terminal_write(telnet_client->term, buffer, bytes_read);
+    while ((bytes_read = guac_terminal_read_stdin(telnet_client->term, buffer, sizeof(buffer))) > 0) 
+    {
+        guac_client_log(client, GUAC_LOG_INFO, "Input before parse(%d): %hhx%hhx%hhx%hhx%hhx", bytes_read, buffer[0], buffer[1], buffer[2], buffer[3], buffer[4]);
+        guac_client_log(client, GUAC_LOG_INFO, "Input before parse: %d-%d-%d-%d-%d-%d-%d-%d-%d-%d", term->charLength[0], term->charLength[1], term->charLength[2], term->charLength[3], term->charLength[4], term->charLength[5], term->charLength[6], term->charLength[7], term->charLength[8], term->charLength[9]);
+        
+        if(term->inVimState)
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Input in vim state");
+            memset(term->line,0,sizeof(term->line));
+            term->pos = 0;
+            telnet_send(telnet_client->telnet, buffer, bytes_read);
+            if (telnet_client->echo_enabled)
+            {
+                guac_terminal_write(telnet_client->term, buffer, bytes_read);
+            }
+        }
+        else
+        {
+            parseLines(client, term, buffer, bytes_read);
+            guac_client_log(client, GUAC_LOG_INFO, "Input after parse(%d): %s", term->pos, term->line);
+            guac_client_log(client, GUAC_LOG_INFO, "Input after parse: %d-%d-%d-%d-%d-%d-%d-%d-%d-%d", term->charLength[0], term->charLength[1], term->charLength[2], term->charLength[3], term->charLength[4], term->charLength[5], term->charLength[6], term->charLength[7], term->charLength[8], term->charLength[9]);
+        
+            if(term->isEnter)
+            {
+                term->inputState = false;
+                if(term->isForbidden)
+                {
+                    guac_client_log(client, GUAC_LOG_INFO, "Input forbidden!");
+                    //回显
+                    guac_terminal_write(term, term->fbdMsg, strlen(term->fbdMsg));
+                    //\x15清除整行
+                    telnet_send(telnet_client->telnet, "\x15\r", 2);
+                }
+                else
+                {
+                    telnet_send(telnet_client->telnet, buffer, bytes_read);
+                    if (telnet_client->echo_enabled)
+                    {
+                        guac_terminal_write(telnet_client->term, buffer, bytes_read);
+                    }
+                }
+                memset(term->line,0,sizeof(term->line));
+                memset(term->charLength,0,sizeof(term->charLength));
+                term->pos = 0;
+            }
+            else
+            {
+                term->inputState = true;
+                telnet_send(telnet_client->telnet, buffer, bytes_read);
+                if (telnet_client->echo_enabled)
+                {
+                    guac_terminal_write(telnet_client->term, buffer, bytes_read);
+                }
+            }
+            term->isForbidden = false;
+            term->isEnter = false;
+            memset(buffer, 0 , sizeof(buffer));
+        }
     }
 
     return NULL;
@@ -624,6 +679,7 @@ void* guac_telnet_client_thread(void* data) {
             continue;
 
         int bytes_read = read(telnet_client->socket_fd, buffer, sizeof(buffer));
+        buffer[bytes_read] = '\0';
         if (bytes_read <= 0)
             break;
 

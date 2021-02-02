@@ -31,6 +31,10 @@
 #include "terminal/terminal_handlers.h"
 #include "terminal/types.h"
 #include "terminal/typescript.h"
+#include "terminal/redis_hiredis.h"
+#include "terminal/json_object.h"
+#include "terminal/json_tokener.h"
+#include "terminal/linkhash.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -806,23 +810,891 @@ void guac_terminal_commit_cursor(guac_terminal* term) {
 
 }
 
-int guac_terminal_write(guac_terminal* term, const char* c, int size) {
+bool matchReg(char *pattern, char *buf, size_t nmatch, regmatch_t *pmatch)
+{
+    int status;
+    regex_t reg;
+    
+    //编译正则模式
+    status = regcomp(&reg,pattern,REG_EXTENDED);
+    if(status)
+    {
+        return false;
+    }
+    //执行正则表达式和缓存的比较
+    status = regexec(&reg,buf,nmatch,pmatch,0);
+    regfree(&reg);
+    
+    if(status==0)
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+bool isPrintable(char c, int *bytesTotal)
+{
+    bool flag = false;
+
+    /* 1-byte UTF-8 codepoint */
+    if ((c & 0x80) == 0x00) {    /* 0xxxxxxx */
+        *bytesTotal = 1;
+        if(c>=keySpace)
+        {
+            flag = true;
+        }
+    }
+    /* 2-byte UTF-8 codepoint */
+    else if ((c & 0xE0) == 0xC0) { /* 110xxxxx */
+        *bytesTotal = 2;
+        flag = true;
+    }
+    /* 3-byte UTF-8 codepoint */
+    else if ((c & 0xF0) == 0xE0) { /* 1110xxxx */
+        *bytesTotal = 3;
+        flag = true;
+    }
+    /* 4-byte UTF-8 codepoint */
+    else if ((c & 0xF8) == 0xF0) { /* 11110xxx */
+        *bytesTotal = 4;
+        flag = true;
+    }
+    /* Continuation of UTF-8 codepoint */
+    else if ((c & 0xC0) == 0x80) { /* 10xxxxxx */
+        flag = false;
+    }
+    
+    return flag;
+}
+
+bool parseVimState(char *buf)
+{
+    //char pattern[] = "\033[?25h\033[?0c";
+    char pat[100] = {0};
+    regmatch_t pmatch[1];
+    const size_t nmatch=1;
+    bool match = false;
+
+    sprintf(pat, "\033[?25h\033[?0c");
+    match = matchReg(pat, buf, nmatch, pmatch);
+    return match;
+}
+
+void insertNChars(guac_terminal* term, int n, char *cur)
+{
+    int pos = 0;
+    int total = strlen(term->line);
+    
+    while(total>term->pos)
+    {
+        term->line[total+n-1] = term->line[total-1];
+        term->charLength[total+n-1] = term->charLength[total-1];
+        total--;
+    }
+
+    while(pos<n)
+    {
+        term->line[term->pos+pos] = cur[pos];
+        term->charLength[term->pos+pos] = n;
+        pos++;
+    }
+    term->pos += n;
+}
+
+void eraseNPreviousChars(guac_terminal* term, int n)
+{
+    int pos = 0;
+    int total = strlen(term->line);
+
+    if(term->pos < n)
+    {
+        n = term->pos;
+    }
+    
+    if(n==0)
+    {
+        return;
+    }
+
+    pos = term->pos;
+    while(pos<total+n)
+    {
+        term->line[pos-n] = term->line[pos];
+        term->charLength[pos-n] = term->charLength[pos];
+        pos++;
+    }
+    term->pos -= n;
+}
+
+void eraseAllPreviousChars(guac_terminal* term)
+{
+    int pos = 0;
+    int total = strlen(term->line);
+
+    if(term->pos>0)
+    {
+        while(pos<total)
+        {
+            term->line[pos] = term->line[term->pos+pos];
+            term->charLength[pos] = term->charLength[term->pos+pos];
+            pos++;
+        }
+        term->pos = 0;
+    }
+}
+
+void eraseNNextChars(guac_terminal* term, int n)
+{
+    int pos = 0;
+    int total = strlen(term->line);
+    
+    pos = term->pos;
+    while(pos<total)
+    {
+        term->line[pos] = term->line[pos+n];
+        term->charLength[pos] = term->charLength[pos+n];
+        pos++;
+    }
+}
+
+void eraseAllNextChars(guac_terminal* term)
+{
+    int pos = 0;
+    int total = strlen(term->line);
+
+    pos = term->pos;
+    while(pos<total)
+    {
+        term->line[pos] = '\0';
+        term->charLength[pos] = 0;
+        pos++;
+    }
+}
+
+int getCmdFilterRules(guac_client* client, char *user, char *replyStr)
+{
+    char hostname[] = "127.0.0.1";
+    int port = 6379;
+    redisContext *redis_ctx;
+    redisReply *reply;
+    struct timeval tv;
+    
+    redis_ctx  = redisConnect(hostname, port);
+    if (redis_ctx == NULL || redis_ctx->err)
+    {
+        if (redis_ctx) 
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Connection error: %d\n", redis_ctx->err);
+            redisFree(redis_ctx);
+        }
+        else
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Connection error: can't allocate redis context");
+        }
+        return -1;
+    }
+    
+    
+    tv.tv_sec = 1;
+    redisSetTimeout(redis_ctx ,tv);
+
+    reply = redisCommand(redis_ctx, "AUTH enlink");
+    if(reply==NULL)
+    {
+        guac_client_log(client, GUAC_LOG_INFO, "Auth failed!");
+        return -1;
+    }
+    freeReplyObject(reply);
+
+    reply = redisCommand(redis_ctx, "HSET enlink:gate:cmd:rules test \"{\"1\":\"rm\", \"2\":\"reboot\"}\"");
+    freeReplyObject(reply);
+    
+    reply = redisCommand(redis_ctx, "HGET enlink:gate:cmd:rules %s", user);
+    if(reply==NULL)
+    {
+        guac_client_log(client, GUAC_LOG_INFO, "HGET failed!");
+        return -1;
+    }
+    
+    strcpy(replyStr ,reply->str);
+    freeReplyObject(reply);
+    redisFree(redis_ctx);
+    return 0;
+}
+
+bool isCommandForbidden(guac_client* client, char *buf, char *fbdMsg)
+{
+    char user[] = "test";
+    char matchStr[128] = {0};
+    char replyStr[1024] = {0};
+    char *pattern = NULL;
+    regmatch_t pmatch[1];
+    const size_t nmatch=1;
+    bool match = false;
+    int ret = 0;
+
+    ret = getCmdFilterRules(client, user, replyStr);
+    if(ret<0)
+    {
+        return false;
+    }
+
+    guac_client_log(client, GUAC_LOG_INFO, "Redis json:%s", replyStr);
+    json_object* all_json = json_tokener_parse(replyStr);
+    if(all_json  == NULL)
+    {
+        guac_client_log(client, GUAC_LOG_INFO, "Json-c parse error!");
+        return false;
+    }
+
+    json_object_object_foreach(all_json, key, val)
+    {
+        pattern = (char *)json_object_get_string(val);
+        guac_client_log(client, GUAC_LOG_INFO, "Forbidden reg(%s): %s", key, pattern);
+        match = matchReg(pattern, buf, nmatch, pmatch);
+        if(match)
+        {
+            //打印匹配的字符串
+            memcpy(matchStr, buf+pmatch[0].rm_so, pmatch[0].rm_eo-pmatch[0].rm_so);
+            guac_client_log(client, GUAC_LOG_INFO, "Match forbidden:%s", matchStr);
+            sprintf(fbdMsg, "\r\n\033[31mCommand `%s` is forbidden\033[0m\r\n", matchStr);
+            
+            return true;
+        }
+    }
+    /*
+    for(i=0; i < json_object_array_length(all_json); i++)
+    {
+        json_object *item = json_object_array_get_idx(all_json, i);
+        type = json_object_get_type(item);
+        if(type == json_type_string)
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Forbidden reg: %s", json_object_get_string(item));
+            match = matchReg((char *)json_object_get_string(item), buf, nmatch, pmatch);
+            if(match)
+            {
+                //打印匹配的字符串
+                memcpy(matchStr, buf+pmatch[0].rm_so, pmatch[0].rm_eo-pmatch[0].rm_so);
+                guac_client_log(client, GUAC_LOG_INFO, "Forbidden:%s", matchStr);
+                sprintf(fbdMsg, "\r\n\033[31mCommand `%s` is forbidden\033[0m\r\n", matchStr);
+                
+                return true;
+            }
+        }
+    }
+    */
+    json_object_put(all_json);
+    
+    return false;
+}
+
+void handleKey(guac_client* client, guac_terminal* term, int key)
+{
+    bool flag = false;
+    char c = '\0';
+
+    switch(key)
+    {
+        case keyEnter:
+            memset(term->history, 0, sizeof(term->history));
+            memset(term->hisCharLength, 0, sizeof(term->hisCharLength));
+            memset(term->fbdMsg, 0 , sizeof(term->fbdMsg));
+            term->isForbidden = isCommandForbidden(client, term->line, term->fbdMsg);
+            term->isEnter = true;
+            break;
+        case keyTab:
+            term->isTab = true;
+            break;
+        case keyBackspace:
+            eraseNPreviousChars(term, term->charLength[term->pos-1]);
+            break;
+        case keyDelete:
+            eraseNNextChars(term, term->charLength[term->pos]);
+            break;
+        case keyDeleteWord:
+            while(term->pos>0)
+            {
+                if(term->line[term->pos-1] == keySpace && flag)
+                {
+                    break;
+                }
+                else
+                {
+                    if(term->line[term->pos-1] != keySpace)
+                    {
+                        flag = true;
+                    }
+                    
+                    eraseNPreviousChars(term, term->charLength[term->pos-1]);
+                }
+            }
+            break;
+        case keyDeleteForward:
+            eraseAllPreviousChars(term);
+            break;
+        case keyDeleteBackward:
+            eraseAllNextChars(term);
+            break;
+        case keyClearScreen:
+            break;
+        case keyHome:
+            term->pos = 0;
+            break;
+        case keyEnd:
+            term->pos = strlen(term->line);
+            break;
+        case keyLeft:
+            if(term->pos>0)
+            {
+                term->pos -= term->charLength[term->pos-1];
+            }
+            break;
+        case keyRight:
+            if(term->pos<strlen(term->line))
+            {
+                term->pos += term->charLength[term->pos];
+            }
+            break;
+        case keyUp:
+        case keyDown:
+        case keyPgUp:
+        case keyPgDn:
+            memset(term->line,0,sizeof(term->line));
+            memset(term->charLength,0,sizeof(term->charLength));
+            term->pos = 0;
+            if(strlen(term->history))
+            {
+                memcpy(term->line, term->history, sizeof(term->history));
+                memcpy(term->charLength, term->hisCharLength, sizeof(term->hisCharLength));
+                term->pos = strlen(term->line);
+            }
+            term->isHistory = true;
+            break;
+        case keyF1:
+            c = 'A';
+            insertNChars(term, 1, &c);
+            break;
+        case keyF2:
+            c = 'B';
+            insertNChars(term, 1, &c);
+            break;
+        case keyF3:
+            c = 'C';
+            insertNChars(term, 1, &c);
+            break;
+        case keyF4:
+            c = 'D';
+            insertNChars(term, 1, &c);
+            break;
+        case keyF5:
+            c = 'E';
+            insertNChars(term, 1, &c);
+            break;
+        case keyF6:
+        case keyF7:
+        case keyF8:
+        case keyF9:
+        case keyF10:
+        case keyF11:
+        case keyF12:
+            c = '~';
+            insertNChars(term, 1, &c);
+            break;
+    }
+    
+    return;
+}
+
+void parseLines(guac_client* client, guac_terminal* term, char *b, int bytesTotal)
+{
+    int bytesRead = 0;
+    int charLength = 0;
+    char *cur = b;
+    
+    while(bytesRead<bytesTotal)
+    {
+        switch(*cur)
+        {
+            case keyCtrlA:
+                guac_client_log(client, GUAC_LOG_INFO, "keyHome");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyHome);
+                continue;
+            case keyCtrlD:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlD");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyDelete);
+                continue;
+            case keyCtrlE: 
+                guac_client_log(client, GUAC_LOG_INFO, "keyEnd");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyEnd);
+                continue;
+            case keyCtrlH:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlH");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyBackspace);
+                continue;
+            case keyTab:
+                guac_client_log(client, GUAC_LOG_INFO, "keyTab");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyTab);
+                continue;
+            case keyCtrlK:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlK");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyDeleteBackward);
+                continue;
+            case keyCtrlL:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlL");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyClearScreen);
+                continue;
+            case keyEnter:
+                guac_client_log(client, GUAC_LOG_INFO, "keyEnter");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyEnter);
+                return;
+            case keyCtrlN:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlN");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyDown);
+                continue;
+            case keyCtrlP:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlP");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyUp);
+                continue;
+            case keyCtrlU:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlU");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyDeleteForward);
+                continue;
+            case keyCtrlW:
+                guac_client_log(client, GUAC_LOG_INFO, "keyCtrlW");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyDeleteWord);
+                continue;
+            case keyBackspace:
+                guac_client_log(client, GUAC_LOG_INFO, "keyBackspace");
+                bytesRead += 1;
+                cur += 1;
+                handleKey(client, term, keyBackspace);
+                continue;
+        }
+
+        if(bytesTotal >= 3 && cur[0] == keyEscape && cur[1] == '[')
+        {
+            switch(cur[2])
+            {
+                case 'A':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyUp");
+                    bytesRead += 3;
+                    cur += 3;
+                    handleKey(client, term, keyUp);
+                    continue;
+                case 'B':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyDown");
+                    bytesRead += 3;
+                    cur += 3;
+                    handleKey(client, term, keyDown);
+                    continue;
+                case 'C':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyRight");
+                    bytesRead += 3;
+                    cur += 3;
+                    handleKey(client, term, keyRight);
+                    continue;
+                case 'D':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyLeft");
+                    bytesRead += 3;
+                    cur += 3;
+                    handleKey(client, term, keyLeft);
+                    continue;
+            }
+        }
+
+        if(bytesTotal >= 3 && cur[0] == keyEscape && cur[1] == '[' && cur[3] == '~')
+        {
+            switch(cur[2])
+            {
+                case '1':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyHome");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyHome);
+                    continue;
+                case '3':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyDelete");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyDelete);
+                    continue;
+                case '4':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyEnd");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyEnd);
+                    continue;
+                case '5':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyPgUp");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyPgUp);
+                    continue;
+                case '6':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyPgDn");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyPgDn);
+                    continue;
+            }
+        }
+
+        if(bytesTotal >= 6 && cur[0] == keyEscape && cur[1] == '[' && cur[2] == '1' && cur[3] == ';' && cur[4] == '3')
+        {
+            switch(cur[5])
+            {
+                case 'C':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyAltRight");
+                    bytesRead += 6;
+                    cur += 6;
+                    handleKey(client, term, keyAltRight);
+                    continue;
+                case 'D':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyAltLeft");
+                    bytesRead += 6;
+                    cur += 6;
+                    handleKey(client, term, keyAltLeft);
+                    continue;
+            }
+        }
+
+        if(bytesTotal >= 4 && cur[0] == keyEscape && cur[1] == '[' && cur[2] == '[')
+        {
+            switch(cur[3])
+            {
+                case 'A':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyF1");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyF1);
+                    continue;
+                case 'B':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyF2");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyF2);
+                    continue;
+                case 'C':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyF3");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyF3);
+                    continue;
+                case 'D':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyF4");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyF4);
+                    continue;
+                case 'E':
+                    guac_client_log(client, GUAC_LOG_INFO, "keyF5");
+                    bytesRead += 4;
+                    cur += 4;
+                    handleKey(client, term, keyF5);
+                    continue;
+            }
+        }
+
+        if(bytesTotal >= 5 && cur[0] == keyEscape && cur[1] == '[' && cur[4] == '~')
+        {
+            if(cur[2]=='1' && cur[3]=='7')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF6");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF6);
+                continue;
+            }
+            else if(cur[2]=='1' && cur[3]=='8')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF7");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF7);
+                continue;
+            }
+            else if(cur[2]=='1' && cur[3]=='9')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF8");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF8);
+                continue;
+            }
+            else if(cur[2]=='2' && cur[3]=='0')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF9");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF9);
+                continue;
+            }
+            else if(cur[2]=='2' && cur[3]=='1')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF10");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF10);
+                continue;
+            }
+            else if(cur[2]=='2' && cur[3]=='2')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF11");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF11);
+                continue;
+            }
+            else if(cur[2]=='2' && cur[3]=='3')
+            {
+                guac_client_log(client, GUAC_LOG_INFO, "keyF12");
+                bytesRead += 5;
+                cur += 5;
+                handleKey(client, term, keyF12);
+                continue;
+            }
+        }
+
+        if(isPrintable(*cur, &charLength))
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Normal char length:%d", charLength);
+            insertNChars(term, charLength, cur);
+            bytesRead += charLength;
+            cur += charLength;
+        }
+        else
+        {
+            guac_client_log(client, GUAC_LOG_INFO, "Unknow key:%s", cur);
+            bytesRead += 1;
+            cur += 1;
+            break;
+        }
+    }
+    
+    return;
+}
+
+int guac_terminal_write(guac_terminal* term, const char* c, int size)
+{
+    char needle[] = "\r\n";
+    char pattern[] = "\x1b[?25h\x1b[?0c";
+    char *ret = NULL;
+    bool containsEnter = false;
+    int pos = 0;
+    int charLength = 0;
+
+    guac_terminal_display* display = term->display;
+    guac_client* client = display->client;
+    
+    guac_client_log(client, GUAC_LOG_INFO, "guac_terminal_write(%d):%d/%d/%d/%d", size, term->inputState, term->isHistory, term->isTab,containsEnter);
 
     guac_terminal_lock(term);
-    while (size > 0) {
+    
+    ret = strstr(c, needle);
+    if(ret)
+    {
+        containsEnter = true;
+    }
 
+    //term->inVimState = parseVimState((char *)c);
+    ret = strstr(c, pattern);
+    if(ret)
+    {
+        term->inVimState = true;
+        guac_client_log(client, GUAC_LOG_INFO, "Client in vim state");
+    }
+    else
+    {
+        term->inVimState = false;
+    }
+
+    while (size > 0)
+    {
         /* Read and advance to next character */
-        char current = *(c++);
-        size--;
-
+        char current = *c;
+        guac_client_log(client, GUAC_LOG_INFO, "Client start(%d):%c(%hhX) isHistory=%d isTab=%d", size, current, current, term->isHistory, term->isTab);
+        guac_client_log(client, GUAC_LOG_INFO, "Client pos(%d): %s", term->pos, term->line);
+        
         /* Write character to typescript, if any */
         if (term->typescript != NULL)
             guac_terminal_typescript_write(term->typescript, current);
 
+        if(term->inputState)
+        {
+            if(term->isHistory)
+            {
+                /* Backspace */
+                if(current==keyCtrlH)
+                {
+                    if(term->pos>0)
+                    {
+                        term->pos--;
+                        //term->line[term->pos] = '\0';
+                        //term->charLength[term->pos] = 0;
+                    }
+                }
+                else if(current==keyEscape  && c[1] == '[' && c[2] == 'K')
+                {
+                    pos = term->pos;
+                    while(pos<strlen(term->line))
+                    {
+                        term->line[pos] = '\0';
+                        term->charLength[pos] = 0;
+                        pos++;
+                    }
+                    term->char_handler(term, current);
+                    term->char_handler(term, *(c+1));
+                    term->char_handler(term, *(c+2));
+                    size -= 3;
+                    c += 3;
+                    continue;
+                }
+                else if(current==keyEscape  && c[1] == '[' && c[3] == 'P')
+                {
+                    eraseNNextChars(term, (int)c[2]);
+                    term->char_handler(term, current);
+                    term->char_handler(term, c[1]);
+                    term->char_handler(term, c[2]);
+                    term->char_handler(term, c[3]);
+                    size -= 4;
+                    c += 4;
+                    continue;
+                }
+                else if(term->char_handler == guac_terminal_echo && isPrintable(current, &charLength))
+                {
+                    pos = 0;
+                    while(pos<charLength)
+                    {
+                        term->line[term->pos+pos] = c[pos];
+                        term->charLength[term->pos+pos] = charLength;
+                        term->char_handler(term, c[pos]);
+                        pos++;
+                    }
+                    term->pos += charLength;
+                    size -= charLength;
+                    c += charLength;
+                    continue;
+                }
+            }
+
+            if(term->isTab)
+            {
+                if(!containsEnter)
+                {
+                    /* Backspace */
+                    if(current==keyCtrlH)
+                    {
+                        if(term->pos>0)
+                        {
+                            term->pos--;
+                            //term->line[term->pos] = '\0';
+                            //term->charLength[term->pos] = 0;
+                        }
+                    }
+                    else if(isPrintable(current, &charLength))
+                    {
+                        //insertNChars(term, charLength, (char *)c);
+                        pos = 0;
+                        while(pos<charLength)
+                        {
+                            term->line[term->pos+pos] = c[pos];
+                            term->charLength[term->pos+pos] = charLength;
+                            term->char_handler(term, c[pos]);
+                            pos++;
+                        }
+                        term->pos += charLength;
+                        size -= charLength;
+                        c += charLength;
+                        continue;
+                    }
+                }
+            }
+
+            /*
+            if(*(c-1)==keyEnter && current==keyLF)
+            {
+                memset(term->line,0,sizeof(term->line));
+                term->pos = 0;
+                containsEnter = true;
+            }
+            else
+            {
+                if(containsEnter)
+                {
+                    term->line[term->pos++] = current;
+                }
+            }
+            */
+            
+            /*
+            if(term->isTab)
+            {
+                if(*(c-2)==keyEnter && current==keyLF)
+                {
+                    memset(term->line,0,sizeof(term->line));
+                    term->pos = 0;
+                }
+                else
+                {
+                    term->line[term->pos++] = current;
+                }
+                
+                if(size==0)
+                {
+                    match = matchReg(pattern, term->line, nmatch, pmatch);
+                    term->isTab = false;
+                    guac_client_log(client, GUAC_LOG_INFO, "isTab end(%d): %s", term->pos, term->line);
+                }
+            }
+            */
+        }
+        
         /* Handle character and its meaning */
         term->char_handler(term, current);
-
+        size--;
+        c++;
     }
+
+    if(term->isHistory)
+    {
+        memcpy(term->history, term->line, sizeof(term->line));
+        memcpy(term->hisCharLength, term->charLength, sizeof(term->charLength));
+        pos = strlen(term->line);
+        term->history[pos] = '\0';
+        term->isHistory = false;
+    }
+    
+    if(term->isTab)
+    {
+        term->isTab = false;
+    }
+
+    guac_client_log(client, GUAC_LOG_INFO, "guac_terminal_write end(%d): %s", term->pos, term->line);
     guac_terminal_unlock(term);
 
     guac_terminal_notify(term);

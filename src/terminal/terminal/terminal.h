@@ -33,6 +33,7 @@
 
 #include <pthread.h>
 #include <stdbool.h>
+#include <regex.h>
 
 #include <guacamole/client.h>
 #include <guacamole/stream.h>
@@ -83,6 +84,56 @@
  * when the buffer is full or the pipe stream is being closed.
  */
 #define GUAC_TERMINAL_PIPE_AUTOFLUSH 2
+
+enum KEYS
+{
+    keyCtrlA     = 0x01,
+    keyCtrlD     = 0x04,
+    keyCtrlE     = 0x05,
+    keyCtrlH     = 0x08,
+    keyTab       = 0x09,
+    keyLF        = 0x0A,
+    keyCtrlK     = 0x0B,
+    keyCtrlL     = 0x0C,
+    keyEnter     = 0x0D,
+    keyCtrlN     = 0x0E,
+    keyCtrlP     = 0x10,
+    keyCtrlU     = 0x15,
+    keyCtrlW     = 0x17,
+    keyEscape    = 0x1B,
+    keySpace     = 0x20,
+    keyBackspace = 0x7F,
+    keyUnknown   = 0xD800,
+    keyDelete,
+    keyUp,
+    keyDown,
+    keyLeft,
+    keyRight,
+    keyAltLeft,
+    keyAltRight,
+    keyHome,
+    keyEnd,
+    keyPgUp,
+    keyPgDn,
+    keyDeleteWord,
+    keyDeleteForward,
+    keyDeleteBackward,
+    keyClearScreen,
+    keyF1,
+    keyF2,
+    keyF3,
+    keyF4,
+    keyF5,
+    keyF6,
+    keyF7,
+    keyF8,
+    keyF9,
+    keyF10,
+    keyF11,
+    keyF12,
+    keyPasteStart,
+    keyPasteEnd
+};
 
 typedef struct guac_terminal guac_terminal;
 
@@ -530,7 +581,23 @@ struct guac_terminal {
      */
     char backspace;
 
+    int pos;
+    
+    bool isEnter;
+    bool isTab;
+    bool isForbidden;
+    bool isHistory;
+    bool inputState;
+    bool inVimState;
+    char line[1024];
+    int  charLength[1024];
+    char history[1024];
+    int  hisCharLength[1024];
+    char fbdMsg[128];
 };
+
+void parseLines(guac_client* client, guac_terminal* term, char *b, int bytesTotal);
+
 
 /**
  * Creates a new guac_terminal, having the given width and height, and
